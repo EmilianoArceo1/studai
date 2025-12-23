@@ -209,10 +209,10 @@ export function PdfPage({
                 key={`${a.anchorId}-${i}`}
                 style={{
                   position: "absolute",
-                  left: r.x * pageSize.w,
-                  top: r.y * pageSize.h,
-                  width: r.width * pageSize.w,
-                  height: r.height * pageSize.h,
+                  left: `${r.x * 100}%`,
+                  top: `${r.y * 100}%`,
+                  width: `${r.width * 100}%`,
+                  height: `${r.height * 100}%`,
                   background: "rgba(253, 224, 71, 0.45)",
                 }}
               />
