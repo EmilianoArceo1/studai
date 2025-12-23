@@ -1,0 +1,5 @@
+export enum IdeaOrigin {
+  FROM_HIGHLIGHT = "FROM_HIGHLIGHT",
+  FROM_COMMENT = "FROM_COMMENT",
+  MANUAL = "MANUAL",
+}
