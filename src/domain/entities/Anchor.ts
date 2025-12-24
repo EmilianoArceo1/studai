@@ -1,6 +1,6 @@
 // domain/entities/Anchor.ts
 
-export interface AnchorRect {
+export interface Anchor {
   /** Normalizado respecto al viewport (0–1) */
   x: number;
   y: number;
@@ -16,7 +16,7 @@ export interface Anchor {
   quote: string;
 
   /** Rects NORMALIZADOS */
-  rects: AnchorRect[];
+  rects: Anchor[];
 
   resolverStrategy: string;
   resolverConfidence: number;

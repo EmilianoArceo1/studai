@@ -1,50 +1,51 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
-import { v4 as uuid } from "uuid";
 
+import type { Anchor } from "./domain/entities/Anchor";
 import { NotesPanel } from "./ui/NotesPanel/NotesPanel";
-import {  PdfViewer } from "./ui/PdfViewer/PdfViewer";
+import { PdfViewer } from "./ui/PdfViewer/PdfViewer";
+import type { PdfViewerHandle } from "./ui/PdfViewer/PdfViewer";
 
 import { Dashboard } from "./ui/Dashboard/Dashboard";
-import { useAppStore } from "./app/store";
+import "pdfjs-dist/web/pdf_viewer.css";
 
 document.body.style.margin = "0";
 
-function Workspace({ pdfUrl }: { pdfUrl: string }) {
-  const addAnchor = useAppStore((s) => s.addAnchor);
+/* ───────────────── Workspace ───────────────── */
 
-  // 🔑 ESTE estado faltaba
-  const [goToPage, setGoToPage] = useState<number | null>(null);
+function Workspace({ pdfUrl }: { pdfUrl: string }) {
+  const pdfViewerRef = useRef<PdfViewerHandle | null>(null);
+  const [activeAnchor, setActiveAnchor] = useState<Anchor | null>(null);
 
   return (
-    <div style={{ display: "flex", gap: 20 }}>
+    <div
+      style={{
+        display: "flex",
+        gap: 20,
+        height: "100vh",
+        overflow: "hidden",
+      }}
+    >
       <PdfViewer
+        ref={pdfViewerRef}
         file={pdfUrl}
-        scrollToPage={goToPage}
-        onSelectText={({ quote, pageNumber }) => {
-          addAnchor({
-            anchorId: uuid(),
-            projectId: "demo-project",
-            sourceId: pdfUrl, // temporal
-            pageNumber,
-            quote,
-            resolverStrategy: "QUOTE_CONTEXT",
-            resolverConfidence: 0.9,
-            createdAt: new Date().toISOString(),
-          });
+        onRequestComment={(anchor) => {
+          setActiveAnchor(anchor);
+          pdfViewerRef.current?.goToAnchor(anchor);
         }}
       />
 
       <NotesPanel
-        onGoToPage={(pageNumber) => {
-          setGoToPage(null);
-          setTimeout(() => setGoToPage(pageNumber), 0);
+        activeAnchor={activeAnchor}
+        onGoToAnchor={(anchor) => {
+          pdfViewerRef.current?.goToAnchor(anchor);
         }}
-
       />
     </div>
   );
 }
+
+/* ───────────────── App ───────────────── */
 
 function App() {
   const [view, setView] = useState<"dashboard" | "workspace">("dashboard");
@@ -66,6 +67,8 @@ function App() {
 
   return <Workspace pdfUrl={pdfUrl} />;
 }
+
+/* ───────────────── Bootstrap ───────────────── */
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

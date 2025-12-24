@@ -1,7 +1,7 @@
-export enum IdeaType {
-  DEFINITION = "DEFINITION",
-  CLAIM = "CLAIM",
-  RESULT = "RESULT",
-  EVIDENCE = "EVIDENCE",
-  QUESTION = "QUESTION",
-}
+  export enum IdeaType {
+    DEFINITION = "DEFINITION",
+    CLAIM = "CLAIM",
+    RESULT = "RESULT",
+    EVIDENCE = "EVIDENCE",
+    QUESTION = "QUESTION",
+  }

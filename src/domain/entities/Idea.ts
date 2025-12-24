@@ -19,4 +19,6 @@ export interface Idea {
 
   createdAt: string;
   updatedAt: string;
+
+   hiddenFromNotes?: boolean;
 }
