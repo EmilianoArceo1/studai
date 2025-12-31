@@ -7,6 +7,7 @@ import {
   useState,
   forwardRef,
   useImperativeHandle,
+  useCallback,
 } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import { PdfPage } from "./PdfPage";
@@ -20,85 +21,172 @@ import { IdeaType } from "../../domain/enums/IdeaType";
 
 interface Props {
   file: string;
-  onRequestComment?: (anchor: Anchor) => void; // para que Workspace pueda setActiveAnchor si quiere
+  onRequestComment?: (anchor: Anchor) => void;
 }
 
 export interface PdfViewerHandle {
   goToAnchor: (anchor: Anchor) => void;
 }
 
-type Rect = { x: number; y: number; width: number; height: number };
-
 type CommentDraft = {
   mode: "create" | "edit";
   anchor: Anchor;
-  // posición del panel
   x: number;
   y: number;
-
-  // idea
   ideaId?: string;
   text: string;
   ideaType: IdeaType;
-
-  // relación opcional
   relateToIdeaId: string;
   relationType: RelationType | "";
   relationDirection: "THIS_TO_TARGET" | "TARGET_TO_THIS";
   justification: string;
 };
 
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function normalizePanelPos(x: number, y: number, w = 360, h = 420) {
+  const pad = 10;
+  const maxX = window.innerWidth - w - pad;
+  const maxY = window.innerHeight - h - pad;
+
+  const looksBad =
+    x < pad || y < pad || x > maxX || y > maxY || y > window.innerHeight * 0.75;
+
+  if (looksBad) {
+    return {
+      x: clamp(Math.round((window.innerWidth - w) / 2), pad, maxX),
+      y: clamp(Math.round((window.innerHeight - h) / 2), pad, maxY),
+    };
+  }
+
+  return {
+    x: clamp(x, pad, maxX),
+    y: clamp(y, pad, maxY),
+  };
+}
+
 export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
   { file, onRequestComment },
   ref
 ) {
   const [pdf, setPdf] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
+  const [draft, setDraft] = useState<CommentDraft | null>(null);
+  const [viewerWidth, setViewerWidth] = useState<number>(0);
 
+  const containerRef = useRef<HTMLDivElement>(null);
+  const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const commentBoxRef = useRef<HTMLDivElement>(null);
+  
+  // Usamos refs para el drag en lugar de estado
+  const dragState = useRef({
+    isDragging: false,
+    startX: 0,
+    startY: 0,
+    initialX: 0,
+    initialY: 0,
+  });
+
+  // Zustand state
   const anchors = useAppStore((s) => s.anchors);
   const ideas = useAppStore((s) => s.ideas);
   const relations = useAppStore((s) => s.relations);
+  const highlights = useAppStore((s) => s.highlights);
 
   const loadAnchors = useAppStore((s) => s.loadAnchors);
   const addAnchor = useAppStore((s) => s.addAnchor);
   const addHighlight = useAppStore((s) => s.addHighlight);
-
   const addIdea = useAppStore((s) => s.addIdea);
-  const updateIdea = useAppStore((s) => s.updateIdea); // requerido para editar
+  const updateIdea = useAppStore((s) => s.updateIdea);
   const addRelation = useAppStore((s) => s.addRelation);
 
-  const containerRef = useRef<HTMLDivElement>(null);
-  const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  // Derived data - usar useMemo solo cuando sea necesario
+  const highlightColorByAnchorId = useMemo(() => {
+    const map: Record<string, string> = {};
+    highlights.forEach((h) => {
+      map[h.anchorId] = h.color;
+    });
+    return map;
+  }, [highlights]);
 
-  const [draft, setDraft] = useState<CommentDraft | null>(null);
-  const dragRef = useRef<{ dx: number; dy: number; dragging: boolean } | null>(
-    null
+  const anchorsForFile = useMemo(
+    () => anchors.filter((a) => a.sourceId === file),
+    [anchors, file]
   );
 
-  /* ───────── Load PDF ───────── */
+  const commentIdeas = useMemo(
+    () =>
+      ideas.filter(
+        (i) => i.origin === IdeaOrigin.FROM_COMMENT && i.sourceId === file
+      ),
+    [ideas, file]
+  );
+
+  const ideaByAnchorId = useMemo(() => {
+    const map = new Map<string, Idea>();
+    commentIdeas.forEach((i) => {
+      if (i.anchorId) map.set(i.anchorId, i);
+    });
+    return map;
+  }, [commentIdeas]);
+
+  const commentedAnchorIds = useMemo(
+    () => new Set(commentIdeas.map((i) => i.anchorId).filter(Boolean)),
+    [commentIdeas]
+  );
+
+  const relationCandidates = useMemo(() => {
+    return ideas
+      .filter((i) => i.projectId === "demo-project")
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }, [ideas]);
+
+  // Effects
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const updateWidth = () => {
+      const width = el.clientWidth - 48;
+      setViewerWidth(Math.max(width, 0));
+    };
+
+    const ro = new ResizeObserver(updateWidth);
+    ro.observe(el);
+    updateWidth();
+
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    let isCancelled = false;
 
-    const load = async () => {
-      const loadedPdf = await pdfjsLib.getDocument(file).promise;
-      if (!cancelled) setPdf(loadedPdf);
+    const loadPdf = async () => {
+      try {
+        const loadedPdf = await pdfjsLib.getDocument(file).promise;
+        if (!isCancelled) {
+          setPdf(loadedPdf);
+        }
+      } catch (error) {
+        console.error("Error loading PDF:", error);
+        if (!isCancelled) setPdf(null);
+      }
     };
 
-    load();
+    loadPdf();
+
     return () => {
-      cancelled = true;
+      isCancelled = true;
     };
   }, [file]);
-
-  /* ───────── Load anchors ───────── */
 
   useEffect(() => {
     loadAnchors();
   }, [file, loadAnchors]);
 
-  /* ───────── Navigation ───────── */
-
-  const goToAnchor = (anchor: Anchor) => {
+  // Navigation
+  const goToAnchor = useCallback((anchor: Anchor) => {
     const container = containerRef.current;
     if (!container) return;
 
@@ -116,54 +204,18 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       top: pageTop + yPx - 40,
       behavior: "smooth",
     });
-  };
+  }, []);
 
-  useImperativeHandle(ref, () => ({ goToAnchor }));
+  useImperativeHandle(ref, () => ({ goToAnchor }), [goToAnchor]);
 
-  /* ───────── Derived ───────── */
-
-  const anchorsForFile = useMemo(
-    () => anchors.filter((a) => a.sourceId === file),
-    [anchors, file]
-  );
-
-  const commentIdeas = useMemo(
-    () => ideas.filter((i) => i.origin === IdeaOrigin.FROM_COMMENT && i.sourceId === file),
-    [ideas, file]
-  );
-
-  const ideaByAnchorId = useMemo(() => {
-    const m = new Map<string, Idea>();
-    for (const i of commentIdeas) {
-      if (i.anchorId) m.set(i.anchorId, i);
-    }
-    return m;
-  }, [commentIdeas]);
-
-  const commentedAnchorIds = useMemo(() => {
-    const s = new Set<string>();
-    for (const i of commentIdeas) {
-      if (i.anchorId) s.add(i.anchorId);
-    }
-    return s;
-  }, [commentIdeas]);
-
-  const relationCandidates = useMemo(() => {
-    // Relacionar contra ideas existentes (todas, o solo comments, tu eliges).
-    // Aquí uso todas del proyecto por si luego metes MANUAL también.
-    return ideas
-      .filter((i) => i.projectId === "demo-project")
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  }, [ideas]);
-
-  /* ───────── Open comment editor ───────── */
-
-  const openCreateComment = (anchor: Anchor, x: number, y: number) => {
+  // Comment handlers
+  const openCreateComment = useCallback((anchor: Anchor, x: number, y: number) => {
+    const pos = normalizePanelPos(x, y);
     setDraft({
       mode: "create",
       anchor,
-      x,
-      y,
+      x: pos.x,
+      y: pos.y,
       text: "",
       ideaType: IdeaType.CLAIM,
       relateToIdeaId: "",
@@ -171,20 +223,21 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       relationDirection: "THIS_TO_TARGET",
       justification: "",
     });
-  };
+  }, []);
 
-  const openEditComment = (anchor: Anchor, x: number, y: number) => {
+  const openEditComment = useCallback((anchor: Anchor, x: number, y: number) => {
     const existing = ideaByAnchorId.get(anchor.anchorId);
     if (!existing) {
       openCreateComment(anchor, x, y);
       return;
     }
 
+    const pos = normalizePanelPos(x, y);
     setDraft({
       mode: "edit",
       anchor,
-      x,
-      y,
+      x: pos.x,
+      y: pos.y,
       ideaId: existing.ideaId,
       text: existing.rephrase,
       ideaType: existing.type,
@@ -193,69 +246,113 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       relationDirection: "THIS_TO_TARGET",
       justification: "",
     });
-  };
+  }, [ideaByAnchorId, openCreateComment]);
 
-  /* ───────── Draggable logic ───────── */
+  // DRAG OPTIMIZADO - Eventos nativos del DOM
+  useEffect(() => {
+    if (!draft || !commentBoxRef.current) return;
 
-  const onDragStart = (e: React.MouseEvent) => {
-    if (!draft) return;
-    dragRef.current = {
-      dx: e.clientX - draft.x,
-      dy: e.clientY - draft.y,
-      dragging: true,
+    const handleMouseDown = (e: MouseEvent) => {
+      // Solo arrastrar desde el header
+      const header = commentBoxRef.current?.querySelector('.comment-header');
+      if (!header || !header.contains(e.target as Node)) return;
+
+      e.preventDefault();
+      dragState.current = {
+        isDragging: true,
+        startX: e.clientX,
+        startY: e.clientY,
+        initialX: draft.x,
+        initialY: draft.y,
+      };
+
+      // Agregar estilos durante el drag
+      document.body.style.cursor = "grabbing";
+      document.body.style.userSelect = "none";
     };
-  };
 
-  const onDragMove = (e: React.MouseEvent) => {
-    if (!draft) return;
-    if (!dragRef.current?.dragging) return;
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!dragState.current.isDragging) return;
 
-    const nx = e.clientX - dragRef.current.dx;
-    const ny = e.clientY - dragRef.current.dy;
+      const w = 360;
+      const h = 420;
+      const pad = 10;
+      const maxX = window.innerWidth - w - pad;
+      const maxY = window.innerHeight - h - pad;
 
-    // clamp básico a viewport
-    const pad = 8;
-    const maxX = window.innerWidth - 360 - pad; // ancho aproximado del panel
-    const maxY = window.innerHeight - 220 - pad;
+      const deltaX = e.clientX - dragState.current.startX;
+      const deltaY = e.clientY - dragState.current.startY;
 
-    setDraft((d) =>
-      d
-        ? {
-            ...d,
-            x: Math.max(pad, Math.min(maxX, nx)),
-            y: Math.max(pad, Math.min(maxY, ny)),
-          }
-        : d
-    );
-  };
+      const newX = clamp(dragState.current.initialX + deltaX, pad, maxX);
+      const newY = clamp(dragState.current.initialY + deltaY, pad, maxY);
 
-  const onDragEnd = () => {
-    if (dragRef.current) dragRef.current.dragging = false;
-  };
+      // Actualizar posición usando transform para mejor rendimiento
+      const commentBox = commentBoxRef.current;
+      if (commentBox) {
+        commentBox.style.transform = `translate(${newX}px, ${newY}px)`;
+      }
+    };
 
-  /* ───────── Save comment (create/edit + optional relation) ───────── */
+    const handleMouseUp = () => {
+      if (!dragState.current.isDragging) return;
 
+      // Actualizar estado con la posición final
+      const commentBox = commentBoxRef.current;
+      if (commentBox) {
+        const rect = commentBox.getBoundingClientRect();
+        setDraft(prev => prev ? {
+          ...prev,
+          x: rect.left,
+          y: rect.top
+        } : prev);
+      }
+
+      dragState.current.isDragging = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    const header = commentBoxRef.current.querySelector('.comment-header');
+    if (header) {
+      header.addEventListener('mousedown', handleMouseDown);
+    }
+
+    // Usar eventos del documento para mejor rendimiento
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      if (header) {
+        header.removeEventListener('mousedown', handleMouseDown);
+      }
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+      
+      // Limpiar estilos
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [draft]);
+
+  // Save comment
   const saveDraft = async () => {
     if (!draft) return;
 
     const text = draft.text.trim();
     if (text.length < 10) {
-      // no uses alert en producción, pero aquí es rápido
       alert("El comentario debe tener al menos 10 caracteres.");
       return;
     }
 
-    // Asegurar anchor + highlight siempre
-    const anchorId = draft.anchor.anchorId || crypto.randomUUID();
+    // Prepare anchor
     const anchor: Anchor = {
       ...draft.anchor,
-      anchorId,
       projectId: "demo-project",
       sourceId: file,
       createdAt: draft.anchor.createdAt ?? new Date().toISOString(),
     };
 
-    // Persist anchor (idempotente si ya existe)
+    // 1. Save anchor and highlight
     await addAnchor(anchor);
     await addHighlight({
       highlightId: crypto.randomUUID(),
@@ -264,10 +361,13 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       createdAt: new Date().toISOString(),
     });
 
-    // Crear/editar Idea
+    // 2. Create or update idea
+    let thisIdeaId: string;
+
     if (draft.mode === "create") {
+      thisIdeaId = crypto.randomUUID();
       const idea: Idea = {
-        ideaId: crypto.randomUUID(),
+        ideaId: thisIdeaId,
         projectId: "demo-project",
         sourceId: file,
         anchorId: anchor.anchorId,
@@ -282,52 +382,49 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
       await addIdea(idea);
     } else {
       if (!draft.ideaId) return;
-      await updateIdea(draft.ideaId, {
+      thisIdeaId = draft.ideaId;
+      await updateIdea(thisIdeaId, {
         rephrase: text,
         type: draft.ideaType,
         updatedAt: new Date().toISOString(),
       });
     }
 
-    // Relación opcional
+    // 3. Optional relation
     if (draft.relateToIdeaId && draft.relationType) {
-      const thisIdeaId =
-        draft.mode === "edit"
-          ? draft.ideaId!
-          : // si create, busca por anchor (ya se insertó arriba)
-            (ideas.find((i) => i.anchorId === anchor.anchorId && i.origin === IdeaOrigin.FROM_COMMENT)?.ideaId ??
-              null);
+      const fromIdeaId =
+        draft.relationDirection === "THIS_TO_TARGET"
+          ? thisIdeaId
+          : draft.relateToIdeaId;
 
-      if (thisIdeaId) {
-        const fromIdeaId =
-          draft.relationDirection === "THIS_TO_TARGET"
-            ? thisIdeaId
-            : draft.relateToIdeaId;
-        const toIdeaId =
-          draft.relationDirection === "THIS_TO_TARGET"
-            ? draft.relateToIdeaId
-            : thisIdeaId;
+      const toIdeaId =
+        draft.relationDirection === "THIS_TO_TARGET"
+          ? draft.relateToIdeaId
+          : thisIdeaId;
 
-        await addRelation({
-          relationId: crypto.randomUUID(),
-          projectId: "demo-project",
-          fromIdeaId,
-          toIdeaId,
-          relationType: draft.relationType,
-          justification: draft.justification?.trim() || undefined,
-          createdAt: new Date().toISOString(),
-        });
-      }
+      await addRelation({
+        relationId: crypto.randomUUID(),
+        projectId: "demo-project",
+        fromIdeaId,
+        toIdeaId,
+        relationType: draft.relationType,
+        justification: draft.justification?.trim() || undefined,
+        createdAt: new Date().toISOString(),
+      });
     }
 
-    // Notificar afuera (opcional) + navegar
+    // 4. Notify parent
     onRequestComment?.(anchor);
-    requestAnimationFrame(() => goToAnchor(anchor));
-
     setDraft(null);
   };
 
-  if (!pdf) return <div style={{ padding: 16 }}>Cargando PDF…</div>;
+  if (!pdf) {
+    return (
+      <div style={{ padding: 16, color: "#94a3b8" }}>
+        Cargando PDF…
+      </div>
+    );
+  }
 
   return (
     <div
@@ -336,32 +433,30 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         position: "relative",
         overflowY: "auto",
         height: "100vh",
+        width: "100%",
         padding: 24,
         background: "#020617",
       }}
-      onMouseMove={onDragMove}
-      onMouseUp={onDragEnd}
-      onMouseLeave={onDragEnd}
     >
       {Array.from({ length: pdf.numPages }, (_, i) => {
         const pageNumber = i + 1;
-
         return (
           <div
             key={pageNumber}
             ref={(el) => {
               if (el) pageRefs.current.set(pageNumber, el);
+              else pageRefs.current.delete(pageNumber);
             }}
             data-page-number={pageNumber}
           >
             <PdfPage
+              highlightColorByAnchorId={highlightColorByAnchorId}
               pdf={pdf}
               pageNumber={pageNumber}
               anchors={anchorsForFile}
               commentedAnchorIds={commentedAnchorIds}
-              onHighlight={({ quote, pageNumber, rects }) => {
+              onHighlight={({ quote, pageNumber, rects, color }) => {
                 const anchorId = crypto.randomUUID();
-
                 const anchor: Anchor = {
                   anchorId,
                   projectId: "demo-project",
@@ -378,14 +473,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                 addHighlight({
                   highlightId: crypto.randomUUID(),
                   anchorId,
-                  color: "#fde047",
+                  color,
                   createdAt: new Date().toISOString(),
                 });
-
-                requestAnimationFrame(() => goToAnchor(anchor));
               }}
               onRequestComment={(payload) => {
-                // crear anchor “base” para este comentario
                 const anchor: Anchor = {
                   anchorId: crypto.randomUUID(),
                   projectId: "demo-project",
@@ -397,9 +489,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                   resolverConfidence: 1,
                   createdAt: new Date().toISOString(),
                 };
-
-                // Abrir editor flotante cerca del click
-                openCreateComment(anchor, payload.clientX + 10, payload.clientY + 10);
+                openCreateComment(
+                  anchor,
+                  payload.clientX + 10,
+                  payload.clientY + 10
+                );
               }}
               onOpenComment={({ anchor, clientX, clientY }) => {
                 openEditComment(anchor, clientX + 10, clientY + 10);
@@ -409,13 +503,15 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
         );
       })}
 
-      {/* ───────── Floating Draggable CommentBox ───────── */}
+      {/* Floating Comment Box - OPTIMIZADO */}
       {draft && (
         <div
+          ref={commentBoxRef}
           style={{
             position: "fixed",
-            top: draft.y,
-            left: draft.x,
+            top: 0,
+            left: 0,
+            transform: `translate(${draft.x}px, ${draft.y}px)`,
             width: 360,
             background: "#0b1220",
             color: "white",
@@ -424,16 +520,18 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
             boxShadow: "0 18px 60px rgba(0,0,0,.55)",
             zIndex: 100000,
             overflow: "hidden",
+            transition: dragState.current.isDragging ? "none" : "transform 0.1s ease",
+            willChange: dragState.current.isDragging ? "transform" : "auto",
           }}
         >
-          {/* Header draggable */}
+          {/* Header - Área de drag */}
           <div
-            onMouseDown={onDragStart}
+            className="comment-header"
             style={{
               padding: "10px 12px",
               background: "rgba(2,6,23,0.9)",
               borderBottom: "1px solid rgba(148,163,184,0.18)",
-              cursor: "grab",
+              cursor: dragState.current.isDragging ? "grabbing" : "grab",
               display: "flex",
               alignItems: "center",
               justifyContent: "space-between",
@@ -444,7 +542,6 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
             <div style={{ fontSize: 13, opacity: 0.9 }}>
               💬 {draft.mode === "edit" ? "Editar comentario" : "Nuevo comentario"}
             </div>
-
             <button
               style={{
                 border: "1px solid rgba(148,163,184,0.25)",
@@ -453,6 +550,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                 borderRadius: 10,
                 padding: "4px 8px",
                 cursor: "pointer",
+                flexShrink: 0,
               }}
               onClick={() => setDraft(null)}
             >
@@ -462,41 +560,45 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
 
           {/* Body */}
           <div style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+            {/* Selection preview */}
             <div style={{ fontSize: 12, opacity: 0.7 }}>
-              Selección: <span style={{ opacity: 1 }}>{draft.anchor.quote.slice(0, 120)}</span>
+              Selección:{" "}
+              <span style={{ opacity: 1 }}>
+                {draft.anchor.quote.slice(0, 120)}
+                {draft.anchor.quote.length > 120 ? "…" : ""}
+              </span>
             </div>
 
-            {/* Tipo */}
-            <div style={{ display: "flex", gap: 8 }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>Tipo</div>
-                <select
-                  value={draft.ideaType}
-                  onChange={(e) =>
-                    setDraft((d) =>
-                      d ? { ...d, ideaType: e.target.value as IdeaType } : d
-                    )
-                  }
-                  style={{
-                    width: "100%",
-                    background: "#0f172a",
-                    color: "white",
-                    border: "1px solid rgba(148,163,184,0.25)",
-                    borderRadius: 10,
-                    padding: "8px 10px",
-                    outline: "none",
-                  }}
-                >
-                  {Object.values(IdeaType).map((t) => (
-                    <option key={t} value={t}>
-                      {t}
-                    </option>
-                  ))}
-                </select>
-              </div>
+            {/* Idea Type */}
+            <div>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>Tipo</div>
+              <select
+                value={draft.ideaType}
+                onChange={(e) =>
+                  setDraft((d) =>
+                    d ? { ...d, ideaType: e.target.value as IdeaType } : d
+                  )
+                }
+                style={{
+                  width: "100%",
+                  background: "#0f172a",
+                  color: "white",
+                  border: "1px solid rgba(148,163,184,0.25)",
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  outline: "none",
+                  cursor: "pointer",
+                }}
+              >
+                {Object.values(IdeaType).map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
             </div>
 
-            {/* Texto */}
+            {/* Comment Text */}
             <div>
               <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 4 }}>Comentario</div>
               <textarea
@@ -520,11 +622,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                 }}
               />
               <div style={{ fontSize: 11, opacity: 0.55, marginTop: 4 }}>
-                Mínimo 10 caracteres. Esto se verá en apuntes tal cual, sin clasificación.
+                Mínimo 10 caracteres.
               </div>
             </div>
 
-            {/* Relación opcional */}
+            {/* Optional Relation */}
             <div style={{ borderTop: "1px solid rgba(148,163,184,0.15)", paddingTop: 10 }}>
               <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 8 }}>
                 Relacionar (opcional)
@@ -535,7 +637,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                   value={draft.relationType}
                   onChange={(e) =>
                     setDraft((d) =>
-                      d ? { ...d, relationType: e.target.value as any } : d
+                      d ? { ...d, relationType: e.target.value as RelationType } : d
                     )
                   }
                   style={{
@@ -546,6 +648,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                     borderRadius: 10,
                     padding: "8px 10px",
                     outline: "none",
+                    cursor: "pointer",
                   }}
                 >
                   <option value="">(sin relación)</option>
@@ -559,10 +662,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                   onChange={(e) =>
                     setDraft((d) =>
                       d
-                        ? {
-                            ...d,
-                            relationDirection: e.target.value as any,
-                          }
+                        ? { ...d, relationDirection: e.target.value as any }
                         : d
                     )
                   }
@@ -574,6 +674,7 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                     borderRadius: 10,
                     padding: "8px 10px",
                     outline: "none",
+                    cursor: "pointer",
                   }}
                 >
                   <option value="THIS_TO_TARGET">este → objetivo</option>
@@ -597,17 +698,21 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                     borderRadius: 10,
                     padding: "8px 10px",
                     outline: "none",
+                    cursor: "pointer",
                   }}
                   disabled={!draft.relationType}
                 >
                   <option value="">
-                    {draft.relationType ? "Selecciona una idea objetivo…" : "Selecciona relación primero"}
+                    {draft.relationType
+                      ? "Selecciona una idea objetivo…"
+                      : "Selecciona relación primero"}
                   </option>
                   {relationCandidates
                     .filter((i) => i.ideaId !== draft.ideaId)
                     .map((i) => (
                       <option key={i.ideaId} value={i.ideaId}>
                         {i.type}: {i.rephrase.slice(0, 60)}
+                        {i.rephrase.length > 60 ? "…" : ""}
                       </option>
                     ))}
                 </select>
@@ -647,12 +752,14 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                   borderRadius: 12,
                   padding: "10px 0",
                   cursor: "pointer",
+                  transition: "background 0.2s ease",
                 }}
                 onClick={() => setDraft(null)}
+                onMouseEnter={(e) => e.currentTarget.style.background = "rgba(148,163,184,0.25)"}
+                onMouseLeave={(e) => e.currentTarget.style.background = "rgba(148,163,184,0.18)"}
               >
                 Cancelar
               </button>
-
               <button
                 style={{
                   flex: 1,
@@ -662,8 +769,11 @@ export const PdfViewer = forwardRef<PdfViewerHandle, Props>(function PdfViewer(
                   borderRadius: 12,
                   padding: "10px 0",
                   cursor: "pointer",
+                  transition: "background 0.2s ease",
                 }}
                 onClick={saveDraft}
+                onMouseEnter={(e) => e.currentTarget.style.background = "#1d4ed8"}
+                onMouseLeave={(e) => e.currentTarget.style.background = "#2563eb"}
               >
                 Guardar
               </button>
